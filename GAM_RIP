@@ -1,0 +1,305 @@
+#load packages
+library(here)
+library(ggplot2)
+library(lattice)
+library(mgcv)
+library(margins)
+library(scales)
+library(progress)
+library(tidyverse)
+library(caret) 
+library(dplyr)
+library(gratia)
+library(MuMIn)
+library(Metrics) 
+rm(list = ls())
+## load tables
+explanatory <- read.csv("explanatory.variables.csv", head=T, sep=",")
+response <- read.csv("response.variables.csv", head=T, sep = ",")
+
+
+#### transform Variables with outliers ####
+master <- as.data.frame(explanatory)
+master$alt500 <- log(master$alt500+1)
+master$basin_area <- log(master$basin_area+1)
+master$source_dist <- sqrt(master$source_dist)
+master$eucalyptus <- log(master$eucalyptus+1)
+master$sum_fire_ha_00.04 <- log(master$sum_fire_ha_00.04+1)
+master$slope10 <- log(master$slope10 +1)
+
+# merge explanatory and response variables
+master <- merge(master, response, by="Cod_DQA")
+
+# add factorial variables
+master$cod_basin_PRG <- as.factor(explanatory$cod_basin_PRG)
+master$fire <- as.factor(explanatory$fire)
+master$f.protection <- as.factor(explanatory$f.protection)
+master$factor.protection <- as.factor(explanatory$factor.protection)
+
+#subset basins with <5 plots
+master <- subset(master, subset=!(cod_basin_PRG==1|cod_basin_PRG==2| 
+          cod_basin_PRG==5|cod_basin_PRG==9|cod_basin_PRG==11|
+          cod_basin_PRG==14|cod_basin_PRG==15|cod_basin_PRG==16|
+          cod_basin_PRG==17|cod_basin_PRG==25|cod_basin_PRG==26|
+          cod_basin_PRG==27|cod_basin_PRG==28|cod_basin_PRG==29))
+master.z <- as.data.frame(master)
+
+
+
+## Model fitting
+## We started by fitting a model with all variables and then removed nonsignificant 
+## terms to reduce concurvity. Smoothness selection was performed via restricted 
+## maximum likelihood. We selected smooth terms based on approximate p-values (p < 0.05) 
+## and by adding an additional penalty that allowed each smooth term to be removed 
+## during model fitting (Marra and Wood 2011). To account for spatial autocorrelation, 
+## we added a two-dimension smoothing function with the x and y coordinates of the 
+## centroid of the sampling plots. We added river basin to the model as a random effect 
+## to account for the dependence resulting from having several samples from the same basin.
+
+gam_final <- gam(no.invasive~s(alt500) + s(slope10) + s(basin_area) + s(urban) +
+               s(cod_basin_PRG, bs="re") + s(x_lat_degr, y_long_degr), 
+             data=master.z, select=TRUE,family = nb(), method = "REML", se=TRUE) 
+summary(gam_final)
+
+concurvity(gam_final, full = TRUE)
+round(concurvity(gam_final, full = FALSE)$worst, 2)
+par(mfrow=c(2,2))
+
+### gam check
+## To validate the model, we analyzed deviance residuals and checked for normal 
+## distribution and constant variance (Wood 2017) using the gam.check from the mgcv package. 
+
+gam.check(gam_final, cex.lab=1.5, pch =16,cex = 0.3)
+
+
+### Plot of smoothers used in the final model
+
+plot(gam_final, shade = TRUE, seWithMean = TRUE, residuals= TRUE, 
+     shift = coef(gam_final)[1],  cex.lab=1.5, pages=1, pch = 16, cex = 0.2,  
+     all.terms = TRUE)
+
+
+## Model evaluation metrics
+
+Observed.final.model <- master.z$no.invasive
+Predicted.final.model <- predict(gam_final, type="response")
+
+data.frame( R2 = R2(Predicted.final.model, Observed.final.model), 
+            RMSE = RMSE(Predicted.final.model, Observed.final.model),   
+            MAE = MAE(Predicted.final.model, Observed.final.model),     
+            RAE = rae(Observed.final.model, Predicted.final.model)) 
+
+#dispersion parameter for the Negative Binomial Distribution is = 6274414.95
+#R^2 = 0.648
+#Deviance explained = 61.5%
+
+### Cross validation
+### 1.k-fold cross validation (or data split into 80 % training and 20 % test set) 
+## We tested if a model with 80 % of the data would get to a similar result.
+
+## one time
+set.seed(163)
+training.samples <- master.z$no.invasive %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- master.z[training.samples, ]
+test.data <- master.z[-training.samples, ]
+
+# Build the model
+model <- gam(no.invasive ~ s(alt500)  + s(slope10) + s(basin_area) + s(urban) +
+               s(cod_basin_PRG, bs="re") + s(x_lat_degr, y_long_degr), 
+             data=train.data, select=TRUE,family = nb(), method = "REML")
+summary(model)
+
+# Make predictions and compute the R2, RMSE and MAE
+predictions <- model %>% predict(test.data, type="response")
+observed <- test.data$no.invasive
+
+data.frame( R2 = R2(predictions, observed),
+            RMSE = RMSE(predictions, observed),
+            MAE = MAE(predictions, observed), 
+            RAE= rae(observed, predictions))
+
+
+## 1.2 We repeated the k-fold cross validation 100 times with a loop function 
+## and did predicitions with the test data for the whole river network
+
+## data split into training and test set
+## repeat 5 times (exemplary)
+## save all 5 results
+
+# load data for prediction
+newdata <- read.csv("newdat.csv", head=T, sep=",")
+newdata$alt500 <- newdata$altitude
+newdata$alt500[newdata$alt500<0]<-0 #because of coastal areas
+newdata$alt500 <- log(newdata$alt500 + 1)
+newdata$basin_area <- log(newdata$basin_area + 1)
+newdata$slope10 <- log(newdata$slope10 +1)
+
+# prepare to save results from loop
+len.newdata <- nrow(newdata) 
+data <- data.frame(NA_col = rep(NA, len.newdata)) 
+error <- data.frame(R2=numeric(0),RMSE=numeric(0),MAE=numeric(0),RAE=numeric(0))
+
+for(i in 1:5){
+  training.samples <- master.z$no.invasive %>%
+    createDataPartition(p = 0.8, list = FALSE)
+  train.data  <- master.z[training.samples, ]
+  test.data <- master.z[-training.samples, ]
+ 
+  train.model <- gam(no.invasive ~ s(alt500)  + s(slope10) + s(basin_area) + 
+                s(urban) +s(cod_basin_PRG, bs="re") + s(x_lat_degr,y_long_degr), 
+                data=train.data, select=TRUE,family = nb(), method = "REML")
+  # predictions for test data  
+  predictions <- train.model %>% predict(test.data, type="response")
+  # compute the R2, RMSE and MAE, does the same as the metrics package
+  df <- data.frame( R2 = R2(predictions, test.data$no.invasive),
+              RMSE = RMSE(predictions, test.data$no.invasive),
+              MAE = MAE(predictions, test.data$no.invasive), 
+              RAE = rae(test.data$no.invasive, predictions))
+  # add result to data frame
+  error[i,] <- df
+    # predictions for Portugal
+  p <- predict(train.model, newdata=newdata, type="response")
+  
+  # add predictions to dataframe
+  data[,i] <- p
+  colnames(data)[i] <- paste0("Col_", i)    # Renaming new variable
+}
+
+
+head(data)
+print(error)
+
+# combine predictions with predictor table
+newdata$Prediction1 <- data$Col_1
+newdata$Prediction2 <- data$Col_2
+newdata$Prediction3 <- data$Col_3
+newdata$Prediction4 <- data$Col_4
+newdata$Prediction5 <- data$Col_5
+
+# save results
+#folder <- here::here()
+#save <- paste(folder, "Results/Prediction", sep = "/")
+#sink(paste(save, "Prediction.csv", sep = "/")); write.table(newdata, sep= ',');sink()
+
+
+
+### 2. Leave one out cross validation -LOOCV
+LOOCV consists of removing one site at a time, fitting the model with the remaining sites and then making predictions for site that was left out.
+
+len <- nrow(master.z) 
+# create data frame for prediction results
+predictionlist<- data.frame(ID=1:len)
+predictionlist$Cod_DQA <- master.z$Cod_DQA
+predictionlist$Observed <- master.z$no.invasive
+predictionlist <- predictionlist %>%add_column(Prediction = NA)
+predictionlist <- predictionlist %>%add_column(se = NA)
+predictionlist$altitude <- master.z$alt500
+
+system.time(for(i in 1:len){
+  test.data1 <- master.z[i,] # index rows by their (integer) locations
+  train.data1 <- master.z[-i,]
+  
+  model1 <- gam(no.invasive ~ s(alt500) + s(slope10) + s(basin_area)+s(urban) +
+                  s(cod_basin_PRG, bs="re") + s(x_lat_degr, y_long_degr), 
+                data=train.data1, select=TRUE,family = nb(), method = "REML")
+  
+
+  predictions1 <- model1 %>% predict(test.data1, type="response", se.fit=TRUE)
+  #print(predictions1)
+  
+  predictionlist$Prediction[[i]] <- predictions1$fit # writes value in table 
+  predictionlist$se[[i]] <- predictions1$se.fit
+})
+
+# compute the R2, RMSE and MAE, does the same as the metrics package
+data.frame( R2 = R2(predictionlist$Prediction, predictionlist$Observed),
+            RMSE = RMSE(predictionlist$Prediction, predictionlist$Observed),
+            MAE = MAE(predictionlist$Prediction, predictionlist$Observed),
+            RAE = rae(predictionlist$Observed, predictionlist$Prediction))
+
+# save results
+#folder <- here::here()
+#save <- paste(folder, "Results/Prediction", sep = "/", row.names = NULL)
+#sink(paste(save, "crossvalidation_1_at_a_time.csv", sep = "/")); write.table(predictionlist, sep= ','); sink()
+
+
+## Plot of predictions with standard errors compared to observed values. 
+## And a plot that shows the relationship between prediction and inaccuracy.
+
+par(mfrow=c(1,1))
+head(predictionlist)
+x=1:length(predictionlist$Prediction)
+predictionlist$altitude <- master.z$alt500
+predictionlist$x_lat_degr <- master.z$x_lat_degr
+predictionlist$y_long_degr <- master.z$y_long_degr
+
+
+plot(x, predictionlist$Observed, cex=0.3, xlab = "Survey Site ID", 
+     ylab="IAS Richness", ylim = c(0,13))
+arrows(x, predictionlist$Prediction- predictionlist$se*2, x, 
+       predictionlist$Prediction+ predictionlist$se*2, col="red",
+       length=0.05, angle=90, code=3)
+points(x, predictionlist$Observed, cex=0.3)
+points(x, predictionlist$Prediction, cex = 0.3, col= "red")
+legend(342, 13, legend=c("Observed Value", "Predicted Value"),
+       col=c("black", "red"), pch=19, cex=0.9)
+
+yp=predictionlist$Observed-predictionlist$Prediction
+lout=length(yp[yp>predictionlist$se*2 | yp< -predictionlist$se*2])
+print(lout)
+print(length(yp)-lout)
+
+plot(predictionlist$Prediction, predictionlist$se, xlab = "Predicted Number of 
+     IAS", ylab= "Predicted Standard Error")
+
+## Last we plotting residuals against predictors as a last check to see if there are really no patterns in the residuals.
+
+attach(master.z)
+X1 <- c(basin_area,alt500,slope10,urban,cod_basin_PRG,x_lat_degr, y_long_degr)
+
+invasive <- rep((residuals(gam_final, type = "pearson")), 7)
+I <- rep(c( "basin_area", "altitude", "slope", "urban",
+            "Cod_basin_PRG", "x_lat", "y_long"), each = 382)
+ID <- rep(I, 7)
+
+xyplot(invasive~X1 | ID, col = 1, 
+       strip = function(bg = 'white', ...)
+         strip.default(bg='white', ...),
+       scales = list(alternating=TRUE,
+                     x = list(relation = "free"),
+                     y = list(relation = "same")),
+       xlab = "Explanatory variables",
+       ylab = "Residuals of Model: gam_n",
+       panel = function(x,y){
+         panel.grid(h = -1, v = 2)
+         panel.points(x, y, col = 1)
+         panel.loess(x, y, col = 1, lwd = 2)
+       })
+detach(master.z)
+
+
+## Prediction for all river segments
+## Last chunk of code uses data with covariates from all river segments in Portugal 
+## and final model to make prediction for IAS richness for all river segments in Portugal. 
+## This data was used to create the final overview maps.
+
+# predict for rivers points every 1 km with complete data set
+# load new data 
+newdata <- read.csv("newdat.csv", head=T, sep=",")
+newdata$alt500 <- newdata$altitude
+newdata$alt500[newdata$alt500<0]<-0
+newdata$alt500 <- log(newdata$alt500 + 1)
+newdata$basin_area <- log(newdata$basin_area + 1)
+newdata$slope10 <- log(newdata$slope10 + 1)
+
+p1 <- predict(gam_final, newdata=newdata, se.fit=TRUE, type="response")
+
+newdata$pred.mod <- p1$fit
+newdata$uci <- p1$fit + (2 * p1$se.fit) # get lower confidence interval limit
+newdata$lci <- p1$fit - (2 * p1$se.fit) 
+
+#folder <- here::here()
+#save <- paste(folder, "Results/Prediction", sep = "/")
+#sink(paste(save, "Prediction_per_1km_model_with all_datapoints.csv", sep = "/")); write.table(newdata, sep= ','); sink()
+
