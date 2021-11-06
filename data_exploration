@@ -1,0 +1,317 @@
+#load packages
+library(here)
+library(ggplot2)
+library(lattice)
+library(mgcv)
+library(margins)
+library(scales)
+library(progress)
+library(tidyverse)
+library(caret) 
+library(dplyr)
+library(gratia)
+library(MuMIn)
+library(Metrics) 
+
+rm(list = ls())
+## load tables
+explanatory <- read.csv("explanatory.variables.csv", head=T, sep=",")
+response <- read.csv("response.variables.csv", head=T, sep = ",")
+
+## We started with data exploration by looking at potential predictor variables.
+## dotplot all variables 
+
+attach(explanatory)
+par(mfrow=c(2,3))
+hist(fire)
+hist(factor.protection)
+hist(f.protection)
+hist(cod_basin_PRG)
+plot(alt500) #transform
+plot(log(alt500+1)) 
+plot(slope10)
+plot(log(slope10 +1))
+plot(basin_area) #transform
+plot(log(basin_area+1)) 
+plot(source_dist) #transform
+plot(sqrt(source_dist)) 
+plot(agriculture)
+plot(eucalyptus)#transform
+plot(log(eucalyptus+1))
+plot(urban)
+plot(precip00.04)
+plot(tmean00.04)
+plot(tmax00.04) 
+plot(tmin00.04)
+plot(lulc)
+plot(barD_cf)
+plot(log(barD_cf+1))
+plot(DOF)
+plot(DOR)
+plot(SED)
+plot(USE)
+plot(RDD)
+plot(FLD)
+plot(CSI)
+plot(population)#transform
+plot(log(population+1))
+plot(buildings)#transform
+plot(log(buildings+1))
+
+detach(explanatory)
+
+
+### Based on the distribution of the covariates e.g. variables with outliers we transformed some of the covariates
+
+master <- as.data.frame(explanatory)
+master$alt500 <- log(master$alt500+1)
+master$basin_area <- log(master$basin_area+1)
+master$source_dist <- sqrt(master$source_dist)
+master$eucalyptus <- log(master$eucalyptus+1)
+master$population <- log(master$population+1)
+master$buildings <- log(master$buildings+1)
+master$sum_fire_ha_00.04 <- log(master$sum_fire_ha_00.04+1)
+master$slope10 <- log(master$slope10 +1)
+
+## merge explanatory and response variables
+master <- merge(master, response, by="Cod_DQA")
+
+## add factorial variables
+master$cod_basin_PRG <- as.factor(explanatory$cod_basin_PRG)
+master$fire <- as.factor(explanatory$fire)
+master$f.protection <- as.factor(explanatory$f.protection)
+master$factor.protection <- as.factor(explanatory$factor.protection)
+
+## add richness of native species (native to whole PT)
+master$no.native <- response$no.species-response$no.exotic
+
+
+
+##  We selected river basins with at least 5 vegetation surveys in order to have a suffician sample number.
+#subset basins with <5 plots
+master <- subset(master, subset=!(cod_basin_PRG==1| cod_basin_PRG==2| 
+          cod_basin_PRG==5| cod_basin_PRG==9 | cod_basin_PRG==11|  
+          cod_basin_PRG== 14| cod_basin_PRG==15 |  cod_basin_PRG==16 |  
+          cod_basin_PRG==17|  cod_basin_PRG==25 | cod_basin_PRG==26 | 
+          cod_basin_PRG== 27 |  cod_basin_PRG== 28 |  cod_basin_PRG== 29))
+
+
+
+### A look at the response variable IAS Richness, to get an idea of which distribution family to use. We also demonstrate the distribution of the abundance of invasive species here.
+
+## hist response variable
+hist(master$no.invasive)
+
+## compare with abundance of AIS
+res <- hist(master$abund.invasive, right=F)
+plot(res$mids, res$counts)
+x <- res$mids[res$counts!=0]
+y <- res$counts[res$counts!=0]
+res.lm <- lm(y~x)
+abline(res.lm, col="red")
+
+plot(log(res$mids), log(res$counts))
+x <- res$mids[res$counts!=0]
+y <- res$counts[res$counts!=0]
+res.lm <- lm(log(y)~log(x))
+abline(res.lm, col="red")
+
+
+## To get an idea of how the covariates relate to the respinse variable IAS richness we create a scatterplot of all covariates variables with the response variable.
+
+attach(master)
+X <- c(fire, f.protection, factor.protection, alt500, slope10,
+       basin_area, source_dist, agriculture, eucalyptus, urban, precip00.04, 
+       tmax00.04, tmean00.04, tmin00.04, lulc, barD_cf, DOF, DOR, SED, USE, 
+       RDD, FLD, CSI, population, buildings, no.native)
+invasive <- rep(no.invasive, 26)
+I <- rep(c( "fire", "protection", "all.protection" ,"altitude",  
+            "slope 10", "basin_area", "source_dist", "agriculture","eucalyptus",
+            "urban", "precip", "tmax","tmean", "tmin", "lulc", "dams", "DOF", 
+            "DOR", "SED", "USE", "RDD", "FLD", "CSI", "population", 
+            "buildings", "no.native spec"), each = 382)
+ID <- rep(I, 26)
+
+xyplot(invasive~X | ID, col = 1, 
+       strip = function(bg = 'white', ...)
+         strip.default(bg='white', ...),
+       scales = list(alternating=TRUE,
+                     x = list(relation = "free"),
+                     y = list(relation = "same")),
+       xlab = "Explanatory variables",
+       ylab = " Number of Invasive Alien Species",
+       panel = function(x,y){
+         panel.grid(h = -1, v = 2)
+         panel.points(x, y, col = 1)
+         panel.loess(x, y, col = 1, lwd = 2)
+       })
+detach(master)
+
+
+
+### Test for multicolinearity.
+## To reduce the effect of correlation among covariates we selected a set of covariates 
+## with low pairwise correlations < 0.7 and variance inflation factors (vif) < 3 (Zuur et al. 2009). 
+## The variance inflation factor tests for multicolinearity. We drop one by one covariate until 
+## we reach vif \textless 3 for all covariates.
+
+corvif<-function(dataz) {
+  dataz <- as.data.frame(dataz)
+  #correlation part
+  cat("Correlations of the variables\n\n")
+  tmp_cor <- cor(dataz,use="complete.obs")
+  print(tmp_cor)
+  
+  #vif part
+  form    <- formula(paste("fooy ~ ",paste(strsplit(names(dataz)," "),
+                                           collapse=" + ")))
+  dataz   <- data.frame(fooy=1,dataz)
+  lm_mod  <- lm(form,dataz)
+  
+  cat("\n\nVariance inflation factors\n\n")
+  print(myvif(lm_mod))
+}
+
+myvif<-function(mod) {
+  v <- vcov(mod)
+  assign <- attributes(model.matrix(mod))$assign
+  if (names(coefficients(mod)[1]) == "(Intercept)") {
+    v <- v[-1, -1]
+    assign <- assign[-1]
+  } else warning("No intercept: vifs may not be sensible.")
+  terms <- labels(terms(mod))
+  n.terms <- length(terms)
+  if (n.terms < 2) stop("The model contains fewer than 2 terms")
+  if (length(assign) > dim(v)[1] ) {
+    diag(tmp_cor)<-0
+    if (any(tmp_cor==1.0)){
+      return("Sample size is too small, 100% collinearity is present")
+    } else {
+      return("Sample size is too small")
+    }
+  }
+  R <- cov2cor(v)
+  detR <- det(R)
+  result <- matrix(0, n.terms, 3)
+  rownames(result) <- terms
+  colnames(result) <- c("GVIF", "Df", "GVIF^(1/2Df)")
+  for (term in 1:n.terms) {
+    subs <- which(assign == term)
+    result[term, 1] <- det(as.matrix(R[subs, subs])) * det(as.matrix(R[-subs,
+                  -subs])) / detR
+    result[term, 2] <- length(subs)
+  }
+  if (all(result[, 2] == 1)) {
+    result <- data.frame(GVIF=result[, 1])
+  } else {
+    result[, 3] <- result[, 1]^(1/(2 * result[, 2]))
+  }
+  invisible(result)
+}
+
+master.z <- subset(master, select=-c(Cod_DQA, ID_AZ, cod_basin_PRG, x_lat_degr, 
+                  y_long_degr,f.protection, fire, factor.protection, no.exotic, 
+                  no.invasive,abund.exotic, abund.invasive, abund.all, slope500, 
+                  URB))
+master.z$no.native <- as.numeric(master.z$no.native)
+master.z$no.species <- as.numeric(master.z$no.species)
+corvif(master.z)
+
+master.z <- subset(master.z, select = -c(DOR, SED, RDD))
+master.z <- subset(master.z, select = -c(tmean00.04, tmin00.04))
+master.z <- subset(master.z, select = -c(no.species, population))
+master.z <- subset(master.z, select = -c(CSI))
+master.z <- subset(master.z, select = -c(source_dist))
+master.z <- subset(master.z, select = -c(precip00.04))
+master.z <- subset(master.z, select = -c(buildings))
+corvif(master.z)
+
+### Pairs "pearson" correlation plot, code by Zuur
+
+######Zuur functions ######
+panel.cor <- function(x, y, digits=1, prefix="", cex.cor = 6){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r1=cor(x,y,use="pairwise.complete.obs")
+  r <- abs(cor(x, y,use="pairwise.complete.obs"))
+  txt <- format(c(r1, 0.123456789), digits=digits)[1]
+  txt <- paste(prefix, txt, sep="")
+  if(missing(cex.cor)) { cex <- 0.9/strwidth(txt) } else {
+    cex = cex.cor}
+  text(0.5, 0.5, txt, cex = cex * r)
+}
+
+panel.smooth2=function (x, y, col = par("col"), bg = NA, pch = par("pch"),
+              cex = 1, col.smooth = "black", span = 2/3, iter = 3, ...){
+  points(x, y, pch = pch, col = col, bg = bg, cex = cex)
+  ok <- is.finite(x) & is.finite(y)
+  if (any(ok))
+    lines(stats::lowess(x[ok], y[ok], f = span, iter = iter),
+          col = 1, ...)
+}
+
+panel.hist <- function(x, ...){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks; nB <- length(breaks)
+  y <- h$counts; y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col="white", ...)
+}
+
+Mypairs <- function(Z) {
+  MyVarx <- colnames(Z)
+  pairs(Z, labels = MyVarx,
+        cex.labels =  2,
+        lower.panel = function(x, y, digits=2, prefix="", cex.cor = 7) {
+          panel.cor(x, y, digits, prefix, cex.cor)}, 
+        upper.panel =  function(x, y) points(x, y, 
+                                             pch = 16, cex = 0.8, 
+                                             col = gray(0.1)))
+}
+
+
+
+# plot after corvif
+pairs(master.z, lower.panel = panel.smooth2, upper.panel = panel.cor, diag.panel = panel.hist)
+
+# plot with factor variables´
+master.p <- as.data.frame(master.z)
+master.p$fire <- as.factor(master$fire)
+master.p$f.protection <- as.factor(master$f.protection)
+master.p$cod_basin_PRG <- as.factor(master$cod_basin_PRG)
+
+pairs(master.p, lower.panel = panel.smooth2, upper.panel = panel.cor, diag.panel = panel.hist)
+
+
+
+### The leftover variables are:  
+
+
+tabl <- "
+|Variable name              |Description    | 
+|---------------------------|:--------------|
+| Cod_DQA                   |   Project ID  |
+|ID_AZ                      | Consecutive ID|
+|x_lat_degr, y_long_degr    | coordinates   |
+|no.invasive                |IAS richness|
+|alt500| elevation hight (m) from an r=500 m buffer|
+|slope10| slope (degree) in an r=10 m buffer|
+|basin_area| catchment area (ha)|
+|agriculture | Percentage of agriculture in an r=500 m buffer|
+|eucalyptus | Percentage of eucalyptus forests in an r=500 m buffer|
+|urban | Percentage of urban areas in an r=500 m buffer|
+|tmax00.04 | max temperature|
+|lulc | land use change index |
+|barD_cf | dam density |
+|DOF | Degree of Fragmentation|
+|USE | Water use |
+|FLD | Floodplain extent| 
+| sum_fire_ha_00.04 | summed ara of fire between 2000 and 2004|
+| no.native | Richness of native species |
+|fire | was area affected by fire |
+|f.protection| is area in a protected zone |
+| cod_basin_PRG | allocated river basin|
+"
+cat(tabl) # output the table in a format good for HTML/PDF/docx conversion
+
